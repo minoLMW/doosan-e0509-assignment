@@ -1,0 +1,16 @@
+# apt packages (Ubuntu 22.04 + ROS2 Humble)
+
+# GUI
+python3-pyqt5
+
+# ROS2 core (usually already installed with ROS2)
+ros-humble-rclpy
+ros-humble-tf2-ros
+ros-humble-tf2-tools
+
+# MoveIt2 / messages (installed by doosan/moveit deps in most setups)
+ros-humble-moveit-msgs
+ros-humble-control-msgs
+ros-humble-geometry-msgs
+ros-humble-sensor-msgs
+ros-humble-std-srvs

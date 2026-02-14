@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from rclpy.qos import qos_profile_sensor_data
+
+from sensor_msgs.msg import JointState
+from std_msgs.msg import String
+
+from tf2_ros import Buffer, TransformListener
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
+
+from my_ros2_assignment_msgs.msg import AssignmentStatus
+
+# motion_state enum
+MOTION_IDLE = 0
+MOTION_PLANNING = 1
+MOTION_EXECUTING = 2
+MOTION_STOPPING = 3
+MOTION_ERROR = 4
+
+
+class AssignmentStatusNode(Node):
+    def __init__(self):
+        super().__init__("assignment_status_node")
+
+        # ---- params ----
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("ee_frame", "tool0")  # 필요 시 tool0/ee_link 등으로 변경
+        self.declare_parameter("controller_name", "dsr_moveit_controller")
+        self.declare_parameter("status_rate_hz", 10.0)
+        self.declare_parameter("log_keep_n", 50)
+
+        self.base_frame = self.get_parameter("base_frame").value
+        self.ee_frame = self.get_parameter("ee_frame").value
+        self.controller_name = self.get_parameter("controller_name").value
+        self.status_rate_hz = float(self.get_parameter("status_rate_hz").value)
+        self.log_keep_n = int(self.get_parameter("log_keep_n").value)
+
+        # ---- cache ----
+        self.last_joint_state = JointState()
+        self.recent_logs = []
+
+        self.motion_state = MOTION_IDLE
+        self.motion_state_text = "IDLE"
+        self.is_moving = False
+        self.active_goal_id = ""
+        self.last_moveit_error_code = 0
+        self.last_error_msg = ""
+
+        self.mode = "abs"
+        self.vel = 0.0
+        self.acc = 0.0
+        self.keep_orientation = False
+        self.target_total = 0
+        self.target_index = 0
+        self.position_error_m = 0.0
+
+        # ---- TF ----
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # ---- pub/sub ----
+        self.pub_status = self.create_publisher(AssignmentStatus, "/assignment/status", 10)
+
+        self.create_subscription(JointState, "/joint_states", self.cb_joint, qos_profile_sensor_data)
+
+        # (선택) movegroup_sequence가 보내는 이벤트를 받으면 motion/log 채움
+        # 예: "state=EXECUTING;idx=0;total=3;log=Send goal"
+        self.create_subscription(String, "/assignment/state_event", self.cb_state_event, 10)
+
+        # ---- timer ----
+        period = 1.0 / max(self.status_rate_hz, 1.0)
+        self.create_timer(period, self.on_timer)
+
+        self.push_log(f"StatusNode start base_frame={self.base_frame}, ee_frame={self.ee_frame}")
+
+    def cb_joint(self, msg: JointState):
+        self.last_joint_state = msg
+
+    def cb_state_event(self, msg: String):
+        text = msg.data.strip()
+        if not text:
+            return
+
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+        kv = {}
+        for p in parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                kv[k.strip()] = v.strip()
+
+        if "state" in kv:
+            st = kv["state"].upper()
+            if st == "IDLE":
+                self.set_motion(MOTION_IDLE, "IDLE", False)
+            elif st == "PLANNING":
+                self.set_motion(MOTION_PLANNING, "PLANNING", True)
+            elif st == "EXECUTING":
+                self.set_motion(MOTION_EXECUTING, "EXECUTING", True)
+            elif st == "STOPPING":
+                self.set_motion(MOTION_STOPPING, "STOPPING", True)
+            elif st == "ERROR":
+                self.set_motion(MOTION_ERROR, "ERROR", False)
+
+        if "goal_id" in kv:
+            self.active_goal_id = kv["goal_id"]
+        if "idx" in kv:
+            try:
+                self.target_index = int(kv["idx"])
+            except:
+                pass
+        if "total" in kv:
+            try:
+                self.target_total = int(kv["total"])
+            except:
+                pass
+        if "mode" in kv:
+            self.mode = kv["mode"]
+        if "vel" in kv:
+            try:
+                self.vel = float(kv["vel"])
+            except:
+                pass
+        if "acc" in kv:
+            try:
+                self.acc = float(kv["acc"])
+            except:
+                pass
+        if "keep_orientation" in kv:
+            self.keep_orientation = kv["keep_orientation"].lower() in ["1", "true", "yes", "y"]
+        if "err" in kv:
+            try:
+                self.last_moveit_error_code = int(kv["err"])
+            except:
+                pass
+        if "msg" in kv:
+            self.last_error_msg = kv["msg"]
+        if "log" in kv:
+            self.push_log(kv["log"])
+
+    def set_motion(self, state: int, text: str, moving: bool):
+        self.motion_state = state
+        self.motion_state_text = text
+        self.is_moving = moving
+
+    def push_log(self, line: str):
+        self.recent_logs.append(line)
+        if len(self.recent_logs) > self.log_keep_n:
+            self.recent_logs = self.recent_logs[-self.log_keep_n :]
+
+    def get_ee_pose(self):
+        """
+        base_frame 기준 ee_frame 위치를 PoseStamped로 만든다.
+        TF가 없으면 None 반환.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                self.ee_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.05),
+            )
+            return tf
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+
+    def check_controller_action_server(self):
+        """
+        엄밀히 서버 존재 여부를 보려면 ActionClient.wait_for_server()가 정석.
+        여기서는 status 노드 단독 실행을 위해 '일단 True'로 두고,
+        3단계에서 실제 체크(ActionClient 기반)로 업그레이드한다.
+        """
+        return True
+
+    def on_timer(self):
+        st = AssignmentStatus()
+        st.header.stamp = self.get_clock().now().to_msg()
+        st.header.frame_id = "assignment_status"
+
+        # Connection (2단계에선 단독 실행을 위해 최소값)
+        st.move_group_available = True
+        st.trajectory_controller_ready = self.check_controller_action_server()
+        st.controller_name = self.controller_name
+
+        # Motion (기본값은 IDLE, 이벤트가 오면 업데이트됨)
+        st.motion_state = self.motion_state
+        st.motion_state_text = self.motion_state_text
+        st.is_moving = self.is_moving
+        st.active_goal_id = self.active_goal_id
+        st.last_moveit_error_code = self.last_moveit_error_code
+        st.last_error_msg = self.last_error_msg
+
+        # Target
+        st.target_total = int(self.target_total)
+        st.target_index = int(self.target_index)
+        st.mode = self.mode
+        st.vel = float(self.vel)
+        st.acc = float(self.acc)
+        st.keep_orientation = bool(self.keep_orientation)
+
+        # Robot state
+        st.joint_state = self.last_joint_state
+
+        tf = self.get_ee_pose()
+        st.ee_pose_base.header.stamp = st.header.stamp
+        st.ee_pose_base.header.frame_id = self.base_frame
+        if tf is not None:
+            st.ee_pose_base.pose.position.x = tf.transform.translation.x
+            st.ee_pose_base.pose.position.y = tf.transform.translation.y
+            st.ee_pose_base.pose.position.z = tf.transform.translation.z
+            st.ee_pose_base.pose.orientation = tf.transform.rotation
+        else:
+            # TF 없을 때 표시용 로그(너무 자주 찍히면 spam이므로 recent_logs에만 남김)
+            self.push_log(f"TF not ready: {self.base_frame} -> {self.ee_frame}")
+
+        st.position_error_m = float(self.position_error_m)
+
+        # Logs
+        st.recent_logs = list(self.recent_logs)
+
+        self.pub_status.publish(st)
+
+
+def main():
+    rclpy.init()
+    node = AssignmentStatusNode()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+
