@@ -153,10 +153,13 @@ sudo apt install -y python3-pyqt5
 python3 ~/ros2_ws/src/my_ros2_assignment/my_ros2_assignment/assignment_gui.py
 
 ### One-click bringup (optional)
+```bash
+cd <repo_root>
 chmod +x start.sh stop.sh
 ./start.sh
 tmux attach -t doosan_assign
-### stop: ./stop.sh
+(종료)
+./stop.sh
 
 
 ---
