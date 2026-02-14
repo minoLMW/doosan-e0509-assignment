@@ -158,6 +158,7 @@ cd <repo_root>
 chmod +x start.sh stop.sh
 ./start.sh
 tmux attach -t doosan_assign
+```
 (종료)
 ./stop.sh
 
